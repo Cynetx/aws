@@ -3,6 +3,7 @@ set -euo pipefail
 
 # ==============================================================================
 # Automated Anti-Ban 3X-UI (Reality + WARP) Deployment Script for AWS EC2
+# Repository: https://github.com/Cynetx/aws
 # ==============================================================================
 
 RED='\033[0;31m'
@@ -25,9 +26,9 @@ PANEL_USER="${PANEL_USER:-admin_$(openssl rand -hex 3)}"
 PANEL_PASS="${PANEL_PASS:-$(openssl rand -base64 14 | tr -dc 'A-Za-z0-9' | head -c 16)}"
 WEB_PATH="${WEB_PATH:-panel$(openssl rand -hex 4)}"
 REALITY_PORT_1=443
-REALITY_SNI_1="www.spotify.com"
+REALITY_SNI_1="www.yahoo.com"
 REALITY_PORT_2=8443
-REALITY_SNI_2="dl.google.com"
+REALITY_SNI_2="www.icloud.com"
 GRPC_SERVICE="stream$(openssl rand -hex 3)"
 CRED_FILE="/root/vpn-credentials.txt"
 
@@ -135,7 +136,7 @@ else
     log_warn "Cloudflare WARP API rate-limited; falling back to direct freedom outbound."
 fi
 
-# 9. Configure Xray Outbounds and Anti-Ban Routing Rules directly in SQLite
+# 9. Configure Xray Outbounds and Anti-Ban Routing Rules
 log_info "Injecting anti-ban routing rules, WARP outbound, and Reality inbounds..."
 if [[ "$USE_WARP" == true ]]; then
     OUTBOUND_TAG="warp"
@@ -198,14 +199,16 @@ XRAY_TEMPLATE=$(jq -c -n \
         "outbounds": $outbounds
     }')
 
-# 10. Build Inbound 1 (Port 443 Vision) & Inbound 2 (Port 8443 gRPC)
+# 10. Build Inbound 1 (Port 443 Vision) & Inbound 2 (Port 8443 gRPC) with integer tgId & externalProxy
 SETTINGS_1=$(jq -c -n --arg uuid "$UUID_1" --arg sub "$SUB_ID_1" '{
-    "clients": [{"id": $uuid, "flow": "xtls-rprx-vision", "email": "aws-vision-443", "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true, "tgId": "", "subId": $sub, "reset": 0}],
+    "clients": [{"id": $uuid, "flow": "xtls-rprx-vision", "email": "aws-vision-443", "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true, "tgId": 0, "subId": $sub, "reset": 0}],
     "decryption": "none",
     "fallbacks": []
 }')
 
 STREAM_1=$(jq -c -n \
+    --arg ip "$SERVER_IP" \
+    --argjson port "$REALITY_PORT_1" \
     --arg dest "${REALITY_SNI_1}:443" \
     --arg sni "$REALITY_SNI_1" \
     --arg priv "$PRIVATE_KEY" \
@@ -214,7 +217,7 @@ STREAM_1=$(jq -c -n \
     '{
         "network": "tcp",
         "security": "reality",
-        "externalProxy": [],
+        "externalProxy": [{"forceTls": "same", "dest": $ip, "port": $port, "remark": ""}],
         "realitySettings": {
             "show": false,
             "xver": 0,
@@ -236,12 +239,14 @@ STREAM_1=$(jq -c -n \
     }')
 
 SETTINGS_2=$(jq -c -n --arg uuid "$UUID_2" --arg sub "$SUB_ID_2" '{
-    "clients": [{"id": $uuid, "flow": "", "email": "aws-grpc-8443", "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true, "tgId": "", "subId": $sub, "reset": 0}],
+    "clients": [{"id": $uuid, "flow": "", "email": "aws-grpc-8443", "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true, "tgId": 0, "subId": $sub, "reset": 0}],
     "decryption": "none",
     "fallbacks": []
 }')
 
 STREAM_2=$(jq -c -n \
+    --arg ip "$SERVER_IP" \
+    --argjson port "$REALITY_PORT_2" \
     --arg dest "${REALITY_SNI_2}:443" \
     --arg sni "$REALITY_SNI_2" \
     --arg priv "$PRIVATE_KEY" \
@@ -251,7 +256,7 @@ STREAM_2=$(jq -c -n \
     '{
         "network": "grpc",
         "security": "reality",
-        "externalProxy": [],
+        "externalProxy": [{"forceTls": "same", "dest": $ip, "port": $port, "remark": ""}],
         "realitySettings": {
             "show": false,
             "xver": 0,
@@ -336,7 +341,7 @@ echo -e "${CYAN}Password        :${NC} ${PANEL_PASS}"
 echo -e "${CYAN}WARP Status     :${NC} ${USE_WARP}"
 echo ""
 echo -e "${YELLOW}[Step 1] Run this SSH Tunnel command on your PC to open the panel:${NC}"
-echo -e "ssh -N -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} -i norah.pem ubuntu@${SERVER_IP}"
+echo -e "ssh -N -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} -i your-key.pem ubuntu@${SERVER_IP}"
 echo ""
 echo -e "${YELLOW}[Config 1] VLESS + Reality + Vision (Port 443 - High Speed):${NC}"
 echo -e "${VLESS_LINK_1}"
