@@ -5,7 +5,6 @@ set -euo pipefail
 # Automated Anti-Ban 3X-UI (Reality + WARP) Deployment Script for AWS EC2
 # ==============================================================================
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -17,12 +16,10 @@ log_ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_err()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# Ensure root privileges
 if [[ $EUID -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
 
-# Configuration variables (can be overridden via environment variables)
 PANEL_PORT="${PANEL_PORT:-2053}"
 PANEL_USER="${PANEL_USER:-admin_$(openssl rand -hex 3)}"
 PANEL_PASS="${PANEL_PASS:-$(openssl rand -base64 14 | tr -dc 'A-Za-z0-9' | head -c 16)}"
@@ -55,7 +52,7 @@ apt-get update -qq
 apt-get install -y -qq curl wget socat ufw jq openssl sqlite3 wireguard-tools qrencode >/dev/null
 log_ok "System packages installed."
 
-# 3. Enable TCP BBR congestion control
+# 3. Enable TCP BBR congestion control (compatible with Ubuntu 22.04/24.04/26.04)
 log_info "Enabling Google TCP BBR..."
 mkdir -p /etc/sysctl.d
 cat << 'EOF' > /etc/sysctl.d/99-bbr.conf
@@ -88,14 +85,12 @@ systemctl stop x-ui || true
 /usr/local/x-ui/x-ui setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT" -webBasePath "$WEB_PATH" >/dev/null
 /usr/local/x-ui/x-ui setting -listenIP 127.0.0.1 >/dev/null 2>&1 || true
 
-# Ensure webListen is strictly 127.0.0.1 in SQLite DB
-if [[ -f /etc/x-ui/x-ui.db ]]; then
-    sqlite3 /etc/x-ui/x-ui.db "INSERT OR REPLACE INTO settings (key, value) VALUES ('webListen', '127.0.0.1');"
-fi
+DB_PATH="/etc/x-ui/x-ui.db"
+[[ ! -f "$DB_PATH" ]] && log_err "3X-UI database not found at $DB_PATH."
 
-systemctl enable x-ui >/dev/null 2>&1
-systemctl start x-ui
-sleep 3
+sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('webListen', '127.0.0.1');"
+sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('webPort', '${PANEL_PORT}');"
+sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO settings (key, value) VALUES ('webBasePath', '/${WEB_PATH}/');"
 log_ok "3X-UI panel secured on 127.0.0.1:${PANEL_PORT}/${WEB_PATH}/"
 
 # 7. Generate Reality X25519 Keypair and UUIDs
@@ -111,6 +106,8 @@ PUBLIC_KEY=$(echo "$X25519_OUT" | awk -F': ' '/Public|Password/ {print $2}' | tr
 SHORT_ID=$(openssl rand -hex 8)
 UUID_1=$(cat /proc/sys/kernel/random/uuid)
 UUID_2=$(cat /proc/sys/kernel/random/uuid)
+SUB_ID_1=$(openssl rand -hex 8)
+SUB_ID_2=$(openssl rand -hex 8)
 log_ok "Reality keys generated."
 
 # 8. Register Free Cloudflare WARP WireGuard Account
@@ -138,21 +135,8 @@ else
     log_warn "Cloudflare WARP API rate-limited; falling back to direct freedom outbound."
 fi
 
-# 9. Authenticate to 3X-UI Local API
-log_info "Configuring Xray outbounds, anti-ban routing, and inbounds via API..."
-COOKIE_JAR=$(mktemp)
-BASE_URL="http://127.0.0.1:${PANEL_PORT}/${WEB_PATH}"
-
-LOGIN_RES=$(curl -s -c "$COOKIE_JAR" -X POST "${BASE_URL}/login" \
-    -H "Content-Type: application/json" \
-    -d "{\"username\":\"${PANEL_USER}\",\"password\":\"${PANEL_PASS}\"}")
-
-if ! echo "$LOGIN_RES" | grep -q '"success":true'; then
-    rm -f "$COOKIE_JAR"
-    log_err "Failed to authenticate with 3X-UI local API."
-fi
-
-# 10. Configure Outbounds and Anti-Ban Routing Rules
+# 9. Configure Xray Outbounds and Anti-Ban Routing Rules directly in SQLite
+log_info "Injecting anti-ban routing rules, WARP outbound, and Reality inbounds..."
 if [[ "$USE_WARP" == true ]]; then
     OUTBOUND_TAG="warp"
     OUTBOUNDS_JSON=$(jq -n \
@@ -195,7 +179,7 @@ else
     ]'
 fi
 
-XRAY_TEMPLATE=$(jq -n \
+XRAY_TEMPLATE=$(jq -c -n \
     --argjson outbounds "$OUTBOUNDS_JSON" \
     --arg defaultOut "$OUTBOUND_TAG" \
     '{
@@ -214,18 +198,14 @@ XRAY_TEMPLATE=$(jq -n \
         "outbounds": $outbounds
     }')
 
-curl -s -b "$COOKIE_JAR" -X POST "${BASE_URL}/panel/xray/update" \
-    -d "xraySetting=$(jq -rn --arg x "$XRAY_TEMPLATE" '$x|@uri')" >/dev/null
-log_ok "Anti-ban routing rules (Torrent & IR block + WARP outbound) applied."
-
-# 11. Create Inbound 1: VLESS + TCP + Reality + Vision (Port 443)
-SETTINGS_1=$(jq -n --arg uuid "$UUID_1" '{
-    "clients": [{"id": $uuid, "flow": "xtls-rprx-vision", "email": "aws-vision-443", "enable": true}],
+# 10. Build Inbound 1 (Port 443 Vision) & Inbound 2 (Port 8443 gRPC)
+SETTINGS_1=$(jq -c -n --arg uuid "$UUID_1" --arg sub "$SUB_ID_1" '{
+    "clients": [{"id": $uuid, "flow": "xtls-rprx-vision", "email": "aws-vision-443", "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true, "tgId": "", "subId": $sub, "reset": 0}],
     "decryption": "none",
     "fallbacks": []
-}' | jq -c .)
+}')
 
-STREAM_1=$(jq -n \
+STREAM_1=$(jq -c -n \
     --arg dest "${REALITY_SNI_1}:443" \
     --arg sni "$REALITY_SNI_1" \
     --arg priv "$PRIVATE_KEY" \
@@ -234,6 +214,7 @@ STREAM_1=$(jq -n \
     '{
         "network": "tcp",
         "security": "reality",
+        "externalProxy": [],
         "realitySettings": {
             "show": false,
             "xver": 0,
@@ -252,33 +233,15 @@ STREAM_1=$(jq -n \
             }
         },
         "tcpSettings": {"acceptProxyProtocol": false, "header": {"type": "none"}}
-    }' | jq -c .)
+    }')
 
-SNIFFING_JSON='{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
-
-curl -s -b "$COOKIE_JAR" -X POST "${BASE_URL}/panel/inbound/add" \
-    --data-urlencode "up=0" \
-    --data-urlencode "down=0" \
-    --data-urlencode "total=0" \
-    --data-urlencode "remark=AWS-Reality-Vision-443" \
-    --data-urlencode "enable=true" \
-    --data-urlencode "expiryTime=0" \
-    --data-urlencode "listen=" \
-    --data-urlencode "port=${REALITY_PORT_1}" \
-    --data-urlencode "protocol=vless" \
-    --data-urlencode "settings=${SETTINGS_1}" \
-    --data-urlencode "streamSettings=${STREAM_1}" \
-    --data-urlencode "sniffing=${SNIFFING_JSON}" >/dev/null
-log_ok "Inbound 1 created: VLESS + TCP + Reality + Vision (Port ${REALITY_PORT_1})."
-
-# 12. Create Inbound 2: VLESS + gRPC + Reality (Port 8443 Backup)
-SETTINGS_2=$(jq -n --arg uuid "$UUID_2" '{
-    "clients": [{"id": $uuid, "flow": "", "email": "aws-grpc-8443", "enable": true}],
+SETTINGS_2=$(jq -c -n --arg uuid "$UUID_2" --arg sub "$SUB_ID_2" '{
+    "clients": [{"id": $uuid, "flow": "", "email": "aws-grpc-8443", "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true, "tgId": "", "subId": $sub, "reset": 0}],
     "decryption": "none",
     "fallbacks": []
-}' | jq -c .)
+}')
 
-STREAM_2=$(jq -n \
+STREAM_2=$(jq -c -n \
     --arg dest "${REALITY_SNI_2}:443" \
     --arg sni "$REALITY_SNI_2" \
     --arg priv "$PRIVATE_KEY" \
@@ -288,6 +251,7 @@ STREAM_2=$(jq -n \
     '{
         "network": "grpc",
         "security": "reality",
+        "externalProxy": [],
         "realitySettings": {
             "show": false,
             "xver": 0,
@@ -306,27 +270,35 @@ STREAM_2=$(jq -n \
             }
         },
         "grpcSettings": {"serviceName": $svc, "multiMode": false, "idle_timeout": 60, "health_check_timeout": 20}
-    }' | jq -c .)
+    }')
 
-curl -s -b "$COOKIE_JAR" -X POST "${BASE_URL}/panel/inbound/add" \
-    --data-urlencode "up=0" \
-    --data-urlencode "down=0" \
-    --data-urlencode "total=0" \
-    --data-urlencode "remark=AWS-Reality-gRPC-8443" \
-    --data-urlencode "enable=true" \
-    --data-urlencode "expiryTime=0" \
-    --data-urlencode "listen=" \
-    --data-urlencode "port=${REALITY_PORT_2}" \
-    --data-urlencode "protocol=vless" \
-    --data-urlencode "settings=${SETTINGS_2}" \
-    --data-urlencode "streamSettings=${STREAM_2}" \
-    --data-urlencode "sniffing=${SNIFFING_JSON}" >/dev/null
-log_ok "Inbound 2 created: VLESS + gRPC + Reality (Port ${REALITY_PORT_2})."
+SNIFFING_JSON='{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
 
-# Restart panel and Xray core to apply all settings
-rm -f "$COOKIE_JAR"
+# Escape single quotes for SQLite
+SQL_XRAY=$(printf "%s" "$XRAY_TEMPLATE" | sed "s/'/''/g")
+SQL_SET1=$(printf "%s" "$SETTINGS_1" | sed "s/'/''/g")
+SQL_STR1=$(printf "%s" "$STREAM_1" | sed "s/'/''/g")
+SQL_SET2=$(printf "%s" "$SETTINGS_2" | sed "s/'/''/g")
+SQL_STR2=$(printf "%s" "$STREAM_2" | sed "s/'/''/g")
+SQL_SNIF=$(printf "%s" "$SNIFFING_JSON" | sed "s/'/''/g")
+
+sqlite3 "$DB_PATH" << EOF
+INSERT OR REPLACE INTO settings (key, value) VALUES ('xrayTemplateConfig', '${SQL_XRAY}');
+DELETE FROM inbounds WHERE port IN (${REALITY_PORT_1}, ${REALITY_PORT_2});
+INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+VALUES (1, 0, 0, 0, 'AWS-Reality-Vision-443', 1, 0, '', ${REALITY_PORT_1}, 'vless', '${SQL_SET1}', '${SQL_STR1}', 'inbound-${REALITY_PORT_1}', '${SQL_SNIF}');
+INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+VALUES (1, 0, 0, 0, 'AWS-Reality-gRPC-8443', 1, 0, '', ${REALITY_PORT_2}, 'vless', '${SQL_SET2}', '${SQL_STR2}', 'inbound-${REALITY_PORT_2}', '${SQL_SNIF}');
+EOF
+
+log_ok "Database configured with anti-ban routing and dual Reality inbounds."
+
+# Start 3X-UI panel and Xray core
+systemctl enable x-ui >/dev/null 2>&1
 systemctl restart x-ui
 sleep 2
+
+systemctl is-active --quiet x-ui || log_err "3X-UI service failed to start."
 
 # Build client VLESS URIs
 VLESS_LINK_1="vless://${UUID_1}@${SERVER_IP}:${REALITY_PORT_1}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${REALITY_SNI_1}&sid=${SHORT_ID}&spx=%2F&flow=xtls-rprx-vision#AWS-Reality-Vision-443"
