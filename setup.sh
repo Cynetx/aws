@@ -57,13 +57,12 @@ log_ok "System packages installed."
 
 # 3. Enable TCP BBR congestion control
 log_info "Enabling Google TCP BBR..."
-sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-cat << 'EOF' >> /etc/sysctl.conf
+mkdir -p /etc/sysctl.d
+cat << 'EOF' > /etc/sysctl.d/99-bbr.conf
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-sysctl -p >/dev/null
+sysctl --system >/dev/null
 log_ok "TCP BBR enabled ($(sysctl -n net.ipv4.tcp_congestion_control))."
 
 # 4. Configure UFW Firewall
